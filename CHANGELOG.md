@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.1
+
+- Usage graphs: hover (or touch) a graph to see the hour and the value at that point.
+
 ## 1.0.0
 
 First release.
