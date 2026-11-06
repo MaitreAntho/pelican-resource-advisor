@@ -24,4 +24,16 @@ return [
 
     // Suggest lower limits too, not only higher ones.
     'suggest_decrease' => env('RESOURCE_ADVISOR_SUGGEST_DECREASE', true),
+
+    // Discord webhook that receives the alerts (empty: no Discord messages).
+    'discord_webhook' => env('RESOURCE_ADVISOR_DISCORD_WEBHOOK'),
+
+    // Also send the alerts as panel notifications to the root administrators.
+    'notify_admins' => env('RESOURCE_ADVISOR_NOTIFY_ADMINS', false),
+
+    // Alert as soon as a server is killed for lack of memory.
+    'notify_oom' => env('RESOURCE_ADVISOR_NOTIFY_OOM', true),
+
+    // Hour of the daily summary (0 to 23, in the panel timezone), empty to turn it off.
+    'digest_hour' => env('RESOURCE_ADVISOR_DIGEST_HOUR', 9),
 ];

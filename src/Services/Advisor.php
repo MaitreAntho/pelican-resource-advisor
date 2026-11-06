@@ -4,7 +4,10 @@ namespace MaitreAntho\ResourceAdvisor\Services;
 
 use App\Models\ActivityLog;
 use App\Models\Server;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
+use MaitreAntho\ResourceAdvisor\Models\IgnoredServer;
 use MaitreAntho\ResourceAdvisor\Models\ResourceSample;
 
 /**
@@ -25,6 +28,34 @@ class Advisor
     private const MIB = 1048576;
 
     /**
+     * The advice for every server, cached until new samples, limits, crashes or ignores arrive.
+     *
+     * @return array<int, array<string, mixed>> keyed by server id
+     */
+    public function all(): array
+    {
+        $servers = Server::query()->orderBy('id')->get(['id', 'memory', 'disk', 'cpu', 'startup', 'image']);
+
+        $fingerprint = md5(implode('|', [
+            now()->format('Y-m-d H'),
+            ResourceSample::query()->max('id'),
+            $this->crashes()->max('id'),
+            IgnoredServer::query()->get(['server_id', 'until'])->toJson(),
+            $servers->map(fn (Server $server) => [$server->id, $server->memory, $server->disk, $server->cpu, $server->startup, $server->image])->toJson(),
+            json_encode(config('resource-advisor')),
+        ]));
+
+        return Cache::remember("resource-advisor.results.$fingerprint", now()->addMinutes(10), function () use ($servers) {
+            $results = [];
+            foreach ($servers->chunk(200) as $chunk) {
+                $results += $this->analyse($chunk);
+            }
+
+            return $results;
+        });
+    }
+
+    /**
      * @param  Collection<int, Server>  $servers
      * @return array<int, array<string, mixed>> keyed by server id
      */
@@ -43,9 +74,15 @@ class Advisor
 
         $oomKills = $this->oomKills($ids, $since);
 
+        $ignored = IgnoredServer::query()->active()->whereIn('server_id', $ids)->get()->keyBy('server_id');
+
         $out = [];
         foreach ($servers as $server) {
-            $out[$server->id] = $this->analyseServer($server, $samples->get($server->id, collect()), $oomKills[$server->id] ?? 0);
+            $result = $this->analyseServer($server, $samples->get($server->id, collect()), $oomKills[$server->id] ?? []);
+            $ignore = $ignored->get($server->id);
+            $result['ignored'] = $ignore !== null;
+            $result['ignored_until'] = $ignore?->until?->toIso8601String();
+            $out[$server->id] = $result;
         }
 
         return $out;
@@ -53,15 +90,17 @@ class Advisor
 
     /**
      * @param  Collection<int, ResourceSample>  $rows
+     * @param  array<int, Carbon>  $oomKills  when the server was killed for lack of memory
      * @return array<string, mixed>
      */
-    public function analyseServer(Server $server, Collection $rows, int $oomKills = 0): array
+    public function analyseServer(Server $server, Collection $rows, array $oomKills = []): array
     {
         $memory = $this->memory($server, $rows, $oomKills);
         $disk = $this->disk($server, $rows);
         $cpu = $this->cpu($server, $rows);
 
-        $order = [self::INCREASE => 4, self::DECREASE => 3, self::OK => 2, self::COLLECTING => 1, self::UNLIMITED => 0];
+        // Advice first, then "still measuring" so a half judged server is not shown as right sized.
+        $order = [self::INCREASE => 4, self::DECREASE => 3, self::COLLECTING => 2, self::OK => 1, self::UNLIMITED => 0];
         $status = collect([$memory['status'], $disk['status'], $cpu['status']])->sortByDesc(fn ($s) => $order[$s])->first();
         if ($status === self::UNLIMITED) {
             $status = self::OK;
@@ -94,22 +133,28 @@ class Advisor
         return false;
     }
 
-    /** @param Collection<int, ResourceSample> $rows */
-    private function memory(Server $server, Collection $rows, int $oomKills): array
+    /**
+     * @param  Collection<int, ResourceSample>  $rows
+     * @param  array<int, Carbon>  $oomKills
+     */
+    private function memory(Server $server, Collection $rows, array $oomKills): array
     {
         $limit = (int) $server->memory * self::MIB;
+        [$rows, $changedAt] = $this->sinceLimitChange($rows, 'memory_limit', (int) $server->memory);
+        $oomCount = count(array_filter($oomKills, fn (Carbon $at) => $changedAt === null || $at->gte($changedAt)));
+
         $running = $rows->where('running_samples', '>', 0);
         $peak = $this->percentile($running->pluck('memory_max')->all(), 0.95);
         $max = (int) $running->max('memory_max');
         $average = $running->sum('running_samples') > 0 ? (int) ($running->sum('memory_sum') / $running->sum('running_samples')) : 0;
 
-        $base = ['limit' => $limit, 'peak' => $peak, 'max' => $max, 'average' => $average, 'oom_kills' => $oomKills, 'suggested' => null, 'reason' => null];
+        $base = ['limit' => $limit, 'peak' => $peak, 'max' => $max, 'average' => $average, 'oom_kills' => $oomCount, 'changed_at' => $changedAt?->toIso8601String(), 'confirm_at' => null, 'suggested' => null, 'reason' => null];
 
         if ($limit <= 0) {
             return ['status' => self::UNLIMITED] + $base;
         }
 
-        if ($oomKills > 0) {
+        if ($oomCount > 0) {
             return ['status' => self::INCREASE, 'reason' => 'oom', 'suggested' => $this->roundUp(max($limit * 1.5, $max * 1.3), 512 * self::MIB)] + $base;
         }
 
@@ -124,10 +169,10 @@ class Advisor
             return ['status' => self::INCREASE, 'reason' => 'peak', 'suggested' => $this->roundUp(max($peak * 1.3, $limit * 1.25), 512 * self::MIB)] + $base;
         }
 
-        if (!$java && $this->suggestDecrease($rows) && $max / $limit < (float) config('resource-advisor.decrease_threshold', 0.4)) {
+        if (!$java && $this->decreaseEnabled() && $max / $limit < (float) config('resource-advisor.decrease_threshold', 0.4)) {
             $suggested = $this->roundUp(max($max * 1.5, 512 * self::MIB), 512 * self::MIB);
             if ($suggested <= $limit * 0.75) {
-                return ['status' => self::DECREASE, 'reason' => 'low', 'suggested' => $suggested] + $base;
+                return $this->decreaseOrConfirm($rows, $suggested, $base);
             }
         }
 
@@ -142,7 +187,7 @@ class Advisor
         $growth = $this->dailyGrowth($rows);
         $daysLeft = ($limit > 0 && $growth > 0) ? max(0.0, ($limit - $usage) / $growth) : null;
 
-        $base = ['limit' => $limit, 'usage' => $usage, 'growth_per_day' => $growth, 'days_left' => $daysLeft, 'suggested' => null, 'reason' => null];
+        $base = ['limit' => $limit, 'usage' => $usage, 'growth_per_day' => $growth, 'days_left' => $daysLeft, 'confirm_at' => null, 'suggested' => null, 'reason' => null];
 
         if ($limit <= 0) {
             return ['status' => self::UNLIMITED] + $base;
@@ -169,10 +214,10 @@ class Advisor
 
         // Disks fill up with backups, logs and updates: keep three times the usage and at least 2 GiB,
         // and only suggest it when it frees at least half of the space.
-        if ($this->suggestDecrease($rows) && $growth <= 0 && $usage / $limit < 0.25) {
+        if ($this->decreaseEnabled() && $growth <= 0 && $usage / $limit < 0.25) {
             $suggested = $this->roundUp(max($usage * 3, 2048 * self::MIB), 1024 * self::MIB);
             if ($suggested <= $limit / 2) {
-                return ['status' => self::DECREASE, 'reason' => 'low', 'suggested' => $suggested] + $base;
+                return $this->decreaseOrConfirm($rows, $suggested, $base);
             }
         }
 
@@ -183,13 +228,15 @@ class Advisor
     private function cpu(Server $server, Collection $rows): array
     {
         $limit = (float) $server->cpu;
+        [$rows, $changedAt] = $this->sinceLimitChange($rows, 'cpu_limit', (int) $server->cpu);
+
         $running = $rows->where('running_samples', '>', 0);
         $averages = $running->map(fn (ResourceSample $row) => $row->cpu_sum / max(1, $row->running_samples))->all();
         $busy = $this->percentile($averages, 0.95);
         $peak = $this->percentile($running->pluck('cpu_max')->all(), 0.95);
         $typical = $this->percentile($averages, 0.5);
 
-        $base = ['limit' => $limit, 'busy' => round($busy, 1), 'peak' => round($peak, 1), 'suggested' => null, 'reason' => null];
+        $base = ['limit' => $limit, 'busy' => round($busy, 1), 'peak' => round($peak, 1), 'changed_at' => $changedAt?->toIso8601String(), 'confirm_at' => null, 'suggested' => null, 'reason' => null];
 
         if ($limit <= 0) {
             return ['status' => self::UNLIMITED] + $base;
@@ -204,26 +251,64 @@ class Advisor
             return ['status' => self::INCREASE, 'reason' => 'busy', 'suggested' => $this->roundUp(max($peak * 1.3, $limit * 1.5), 50)] + $base;
         }
 
-        if ($this->suggestDecrease($rows) && $limit > 100 && $peak < $limit * 0.3) {
+        if ($this->decreaseEnabled() && $limit > 100 && $peak < $limit * 0.3) {
             $suggested = $this->roundUp(max($peak * 1.5, 100), 50);
             if ($suggested < $limit) {
-                return ['status' => self::DECREASE, 'reason' => 'low', 'suggested' => $suggested] + $base;
+                return $this->decreaseOrConfirm($rows, $suggested, $base);
             }
         }
 
         return ['status' => self::OK] + $base;
     }
 
-    /** Lower limits are only suggested with a full window of data, so a quiet first day is not mistaken for a quiet server. */
-    private function suggestDecrease(Collection $rows): bool
+    private function decreaseEnabled(): bool
     {
-        if (!config('resource-advisor.suggest_decrease', true) || $rows->isEmpty()) {
-            return false;
+        return (bool) config('resource-advisor.suggest_decrease', true);
+    }
+
+    /**
+     * Lower limits are only suggested with a full window of data, so a quiet first day is not
+     * mistaken for a quiet server. Until then the server stays "measuring", with the date the
+     * advice will be confirmed.
+     *
+     * @param  Collection<int, ResourceSample>  $rows
+     * @param  array<string, mixed>  $base
+     * @return array<string, mixed>
+     */
+    private function decreaseOrConfirm(Collection $rows, int|float $suggested, array $base): array
+    {
+        $days = (int) config('resource-advisor.window_days', 7);
+        $confirmAt = $rows->first()->hour->copy()->addDays($days)->subHours(6);
+
+        if ($confirmAt->lte(now())) {
+            return ['status' => self::DECREASE, 'reason' => 'low', 'suggested' => $suggested] + $base;
         }
 
-        $days = (int) config('resource-advisor.window_days', 7);
+        return ['status' => self::COLLECTING, 'reason' => 'confirming', 'suggested' => $suggested, 'confirm_at' => $confirmAt->toIso8601String()] + $base;
+    }
 
-        return $rows->first()->hour->lte(now()->subDays($days)->addHours(6));
+    /**
+     * Keeps the hours measured since the limit was last changed: older hours were measured with
+     * another limit and would give the wrong advice (a crash at 2 GiB says nothing about 3 GiB).
+     * Hours measured before 1.1.0 have no limit recorded and are kept.
+     *
+     * @param  Collection<int, ResourceSample>  $rows  sorted by hour
+     * @return array{0: Collection<int, ResourceSample>, 1: Carbon|null} the rows, and when the limit changed
+     */
+    private function sinceLimitChange(Collection $rows, string $column, int $current): array
+    {
+        $rows = $rows->values();
+
+        for ($i = $rows->count() - 1; $i >= 0; $i--) {
+            $limit = $rows[$i]->{$column};
+            if ($limit !== null && (int) $limit !== $current) {
+                $kept = $rows->slice($i + 1)->values();
+
+                return [$kept, $kept->first()?->hour ?? now()->startOfHour()];
+            }
+        }
+
+        return [$rows, null];
     }
 
     /**
@@ -272,39 +357,49 @@ class Advisor
         return (int) (ceil($value / $step) * $step);
     }
 
+    /** Crash reports sent by Wings. */
+    public function crashes(): \Illuminate\Database\Eloquent\Builder
+    {
+        return ActivityLog::query()->where('event', 'server:crashed');
+    }
+
     /**
-     * Crashes caused by the out of memory killer, as reported by Wings, per server id.
+     * When each server was killed by the out of memory killer, as reported by Wings.
      *
      * @param  array<int, int>  $serverIds
-     * @return array<int, int>
+     * @return array<int, array<int, Carbon>> keyed by server id
      */
-    private function oomKills(array $serverIds, \Illuminate\Support\Carbon $since): array
+    public function oomKills(array $serverIds, Carbon $since): array
     {
         if (!$serverIds) {
             return [];
         }
 
         $morph = (new Server())->getMorphClass();
-        $counts = [];
+        $kills = [];
 
-        ActivityLog::query()
-            ->where('event', 'server:crashed')
+        $this->crashes()
             ->where('timestamp', '>=', $since)
             ->whereHas('subjects', fn ($query) => $query->where('subject_type', $morph)->whereIn('subject_id', $serverIds))
+            ->with('subjects')
             ->get()
-            ->each(function (ActivityLog $log) use (&$counts, $morph) {
-                $oom = $log->properties->get('oomkilled');
-                if (!filter_var($oom, FILTER_VALIDATE_BOOLEAN)) {
+            ->each(function (ActivityLog $log) use (&$kills, $morph, $serverIds) {
+                if (!$this->isOomKill($log)) {
                     return;
                 }
 
                 foreach ($log->subjects as $subject) {
-                    if ($subject->subject_type === $morph) {
-                        $counts[$subject->subject_id] = ($counts[$subject->subject_id] ?? 0) + 1;
+                    if ($subject->subject_type === $morph && in_array((int) $subject->subject_id, $serverIds, true)) {
+                        $kills[(int) $subject->subject_id][] = Carbon::parse($log->timestamp);
                     }
                 }
             });
 
-        return $counts;
+        return $kills;
+    }
+
+    public function isOomKill(ActivityLog $log): bool
+    {
+        return filter_var($log->properties->get('oomkilled'), FILTER_VALIDATE_BOOLEAN);
     }
 }

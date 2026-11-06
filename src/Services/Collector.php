@@ -43,7 +43,7 @@ class Collector
                 continue;
             }
 
-            $servers = $node->servers()->get(['id', 'uuid'])->keyBy('uuid');
+            $servers = $node->servers()->get(['id', 'uuid', 'memory', 'disk', 'cpu'])->keyBy('uuid');
 
             foreach ($entries as $entry) {
                 $uuid = $entry['configuration']['uuid'] ?? null;
@@ -52,7 +52,11 @@ class Collector
                     continue;
                 }
 
-                $this->record($server->id, $hour, $entry['state'] ?? 'offline', $entry['utilization'] ?? []);
+                $this->record($server->id, $hour, $entry['state'] ?? 'offline', $entry['utilization'] ?? [], [
+                    'memory' => (int) $server->memory,
+                    'disk' => (int) $server->disk,
+                    'cpu' => (int) $server->cpu,
+                ]);
                 $result['servers']++;
             }
         }
@@ -60,8 +64,11 @@ class Collector
         return $result;
     }
 
-    /** @param array<string, mixed> $utilization */
-    public function record(int $serverId, Carbon $hour, string $state, array $utilization): void
+    /**
+     * @param  array<string, mixed>  $utilization
+     * @param  array{memory?: int, disk?: int, cpu?: int}  $limits  the limits of the server right now
+     */
+    public function record(int $serverId, Carbon $hour, string $state, array $utilization, array $limits = []): void
     {
         $running = in_array($state, ['running', 'starting'], true);
         $memory = max(0, (int) ($utilization['memory_bytes'] ?? 0));
@@ -73,6 +80,12 @@ class Collector
         $sample->samples = (int) $sample->samples + 1;
         $sample->disk_max = max((int) $sample->disk_max, $disk);
         $sample->disk_last = $disk;
+
+        foreach (['memory', 'disk', 'cpu'] as $key) {
+            if (isset($limits[$key])) {
+                $sample->{$key . '_limit'} = $limits[$key];
+            }
+        }
 
         if ($running) {
             $sample->running_samples = (int) $sample->running_samples + 1;

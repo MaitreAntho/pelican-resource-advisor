@@ -20,6 +20,9 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  * @property float $cpu_sum
  * @property int $disk_max
  * @property int $disk_last
+ * @property int|null $memory_limit MiB, as set on the server during that hour
+ * @property int|null $disk_limit MiB
+ * @property int|null $cpu_limit %
  */
 class ResourceSample extends Model
 {
